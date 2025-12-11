@@ -7,7 +7,7 @@ from datetime import datetime
 import plotly.graph_objects as go
 from scipy.stats import norm
 
-# --- 1. PAGE CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 st.set_page_config(
     page_title="God Mode Terminal",
     page_icon="🦅",
@@ -15,20 +15,15 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# --- MOBILE OPTIMIZED CSS ---
+# --- MOBILE CSS ---
 st.markdown("""
 <style>
     .stApp { background-color: #131722; }
     h1, h2, h3, h4, h5, p, span, div { color: #d1d4dc !important; }
     div[data-testid="metric-container"] {
-        background-color: #1e222d;
-        border: 1px solid #2a2e39;
-        padding: 10px;
-        border-radius: 8px;
+        background-color: #1e222d; border: 1px solid #2a2e39; padding: 10px; border-radius: 8px;
     }
-    label[data-testid="stMetricLabel"] { color: #b2b5be !important; font-size: 14px !important; }
     div[data-testid="stMetricValue"] { color: #00E396 !important; font-size: 24px !important; }
-    
     @media (max-width: 600px) {
         div[data-testid="stMetricValue"] { font-size: 18px !important; }
         .block-container { padding-top: 1rem; padding-bottom: 1rem; }
@@ -36,203 +31,118 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. SESSION STATE ---
+# --- 2. STATE ---
 if 'history' not in st.session_state:
-    st.session_state.history = pd.DataFrame(columns=[
-        'Time', 'NSE_Adv', 'NSE_Dec', 
-        'Coin_Adv', 'Coin_Dec', 
-        'BTC_Price', 'BTC_Funding', 'Net_GEX'
-    ])
+    st.session_state.history = pd.DataFrame(columns=['Time', 'Coin_Adv', 'Coin_Dec', 'BTC_Price'])
 if 'start_oi' not in st.session_state:
     st.session_state.start_oi = 0
 
-# --- 3. HELPER FUNCTIONS ---
-def get_headers():
-    return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
-def hex_to_rgba(hex_val, opacity):
-    h = hex_val.lstrip('#')
-    return f"rgba({int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}, {opacity})"
-
-def calculate_gamma(S, K, T, sigma):
-    if T <= 0.001 or sigma <= 0: return 0
-    d1 = (math.log(S / K) + (0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
-    return gamma
+# --- 3. ROBUST DATA FETCHING ---
+def get_safe_json(url):
+    """Safely fetch JSON without crashing"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+    return None
 
 @st.cache_data(ttl=10)
 def fetch_data_snapshot():
-    # Initialize default values so app doesn't crash
+    # Default Empty Data (Prevents Crashes)
     data = {
         'price': 0, 'funding': 0, 'ls_ratio': 1.0,
         'coin_adv': 0, 'coin_dec': 0, 
-        'nse_adv': 0, 'nse_dec': 0,
         'max_pain': 0, 'gex': 0,
         'call_wall': 0, 'put_wall': 0,
-        'total_oi': 0
+        'total_oi': 0,
+        'source': 'Connecting...'
     }
-    status = "OK"
+    
+    # --- PLAN A: BYBIT (Best Data) ---
+    bybit_data = get_safe_json("https://api.bybit.com/v5/market/tickers?category=linear&limit=1000")
+    if bybit_data and 'result' in bybit_data:
+        try:
+            data['source'] = 'Bybit (Live)'
+            c_adv, c_dec = 0, 0
+            for t in bybit_data['result']['list']:
+                if t['symbol'] == 'BTCUSDT':
+                    data['price'] = float(t['lastPrice'])
+                    data['funding'] = float(t['fundingRate']) * 100
+                try:
+                    if float(t['price24hPcnt']) > 0: c_adv += 1
+                    else: c_dec += 1
+                except: continue
+            data['coin_adv'] = c_adv
+            data['coin_dec'] = c_dec
+            
+            # Options (Walls)
+            opt_data = get_safe_json("https://api.bybit.com/v5/market/tickers?category=option&baseCoin=BTC&limit=100")
+            if opt_data:
+                df = pd.DataFrame(opt_data['result']['list'])
+                df['openInterest'] = df['openInterest'].astype(float)
+                data['total_oi'] = df['openInterest'].sum()
+                
+                # Extract Walls
+                split = df['symbol'].str.split('-', expand=True)
+                df['Type'] = split[3]
+                df['Strike'] = split[2].astype(float)
+                
+                data['call_wall'] = df[df['Type']=='C'].sort_values('openInterest', ascending=False).iloc[0]['Strike']
+                data['put_wall'] = df[df['Type']=='P'].sort_values('openInterest', ascending=False).iloc[0]['Strike']
+        except:
+            pass # Parsing failed, fallback to Plan B
 
-    # --- A. BYBIT (CRYPTO) ---
-    try:
-        market_url = "https://api.bybit.com/v5/market/tickers?category=linear&limit=1000"
-        all_coins = requests.get(market_url, headers=get_headers(), timeout=5).json()
-        
-        c_adv, c_dec = 0, 0
-        
-        for t in all_coins['result']['list']:
-            if t['symbol'] == 'BTCUSDT':
-                data['price'] = float(t['lastPrice'])
-                data['funding'] = float(t['fundingRate']) * 100
-            try:
-                if float(t['price24hPcnt']) > 0: c_adv += 1
-                else: c_dec += 1
-            except: continue
-        
-        data['coin_adv'] = c_adv
-        data['coin_dec'] = c_dec
+    # --- PLAN B: BINANCE (Backup Price) ---
+    if data['price'] == 0:
+        binance_data = get_safe_json("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
+        if binance_data:
+            data['price'] = float(binance_data['price'])
+            data['source'] = 'Binance (Backup)'
 
-    except Exception as e:
-        status = f"Crypto API Error: {str(e)}"
+    # --- PLAN C: COINGECKO (Last Resort) ---
+    if data['price'] == 0:
+        cg_data = get_safe_json("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+        if cg_data:
+            data['price'] = cg_data['bitcoin']['usd']
+            data['source'] = 'CoinGecko (Slow)'
 
-    # --- B. OPTIONS (GEX) ---
-    try:
-        opt_url = "https://api.bybit.com/v5/market/tickers?category=option&baseCoin=BTC&limit=200"
-        opt_res = requests.get(opt_url, headers=get_headers(), timeout=5).json()
-        df = pd.DataFrame(opt_res['result']['list'])
-        
-        df['openInterest'] = df['openInterest'].astype(float)
-        df['bid1Iv'] = df['bid1Iv'].astype(float)
-        split_data = df['symbol'].str.split('-', expand=True)
-        df[['Coin', 'Date', 'Strike', 'Type']] = split_data.iloc[:, :4]
-        df['Strike'] = df['Strike'].astype(float)
-        
-        data['total_oi'] = df['openInterest'].sum()
-        
-        # Walls
-        data['call_wall'] = df[df['Type']=='C'].sort_values('openInterest', ascending=False).iloc[0]['Strike']
-        data['put_wall'] = df[df['Type']=='P'].sort_values('openInterest', ascending=False).iloc[0]['Strike']
-        
-        # Max Pain (Simplified)
-        strikes = df['Strike'].unique()
-        min_loss = float('inf')
-        for k in strikes:
-            if k % 1000 != 0: continue 
-            c_loss = df[(df['Type']=='C') & (df['Strike'] < k)]
-            p_loss = df[(df['Type']=='P') & (df['Strike'] > k)]
-            val = ((k - c_loss['Strike']) * c_loss['openInterest']).sum() + \
-                  ((p_loss['Strike'] - k) * p_loss['openInterest']).sum()
-            if val < min_loss: min_loss = val; data['max_pain'] = k
+    # Approximations if data missing
+    if data['max_pain'] == 0 and data['price'] > 0:
+        data['max_pain'] = round(data['price'] / 1000) * 1000 # Dummy approximation
+    
+    return data
 
-        # GEX (Simplified)
-        total_gex = 0
-        now = datetime.now()
-        for _, row in df.iterrows():
-            if row['openInterest'] < 0.1 or row['bid1Iv'] <= 0: continue
-            try:
-                exp_date = datetime.strptime(row['Date'], "%d%b%y")
-                T = (exp_date - now).days / 365.0
-            except: continue
-            if T < 0.001: T = 0.001
-            gamma = calculate_gamma(data['price'], row['Strike'], T, row['bid1Iv'])
-            gex_val = gamma * row['openInterest'] * data['price'] * 100
-            total_gex += gex_val if row['Type']=='P' else -gex_val
-        data['gex'] = total_gex
-
-    except:
-        pass # If options fail, just keep defaults
-
-    # --- C. NSE INDIA (ATTEMPT ONLY) ---
-    try:
-        s = requests.Session()
-        s.headers.update(get_headers())
-        # NSE requires visiting the homepage first to set cookies
-        s.get("https://www.nseindia.com", timeout=2)
-        nse_res = s.get("https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050", timeout=2).json()
-        data['nse_adv'] = nse_res['advance']['advances']
-        data['nse_dec'] = nse_res['advance']['declines']
-    except:
-        # If NSE blocks us (which is common), just show 0/0 and DONT CRASH
-        data['nse_adv'] = 0
-        data['nse_dec'] = 0
-
-    return data, status
-
-# --- 4. TRADINGVIEW CHART ENGINE ---
-def create_tv_chart(df, y1, y2, title, color1, color2):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df['Time'], y=df[y1], name='Bulls', 
-        line=dict(color=color1, width=2), fill='tozeroy', fillcolor=hex_to_rgba(color1, 0.1)
-    ))
-    fig.add_trace(go.Scatter(
-        x=df['Time'], y=df[y2], name='Bears', 
-        line=dict(color=color2, width=2), fill='tozeroy', fillcolor=hex_to_rgba(color2, 0.1)
-    ))
-    fig.update_layout(
-        title=dict(text=title, font=dict(color='#d1d4dc', size=14)),
-        paper_bgcolor='#1e222d', plot_bgcolor='#131722',
-        height=250, margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=dict(showgrid=True, gridcolor='#2a2e39', tickfont=dict(color='#787b86')),
-        yaxis=dict(showgrid=True, gridcolor='#2a2e39', tickfont=dict(color='#787b86')),
-        legend=dict(orientation="h", y=1, x=1, font=dict(color='#d1d4dc'))
-    )
-    return fig
-
-# --- 5. MAIN DASHBOARD ---
+# --- 4. UI LAYOUT ---
 st.title("🦅 GOD MODE TERMINAL")
 
-# FETCH
-with st.spinner('Syncing...'):
-    d, status = fetch_data_snapshot()
+d = fetch_data_snapshot()
 
-# ERROR HANDLING UI
-if status != "OK":
-    st.warning(f"⚠️ {status}")
-
-# HISTORY
+# Update History
 curr_time = datetime.now().strftime("%H:%M")
-new_row = {
-    'Time': curr_time, 
-    'NSE_Adv': d['nse_adv'], 'NSE_Dec': d['nse_dec'], 
-    'Coin_Adv': d['coin_adv'], 'Coin_Dec': d['coin_dec'],
-    'BTC_Price': d['price'], 'BTC_Funding': d['funding'], 'Net_GEX': d['gex']
-}
+new_row = {'Time': curr_time, 'Coin_Adv': d['coin_adv'], 'Coin_Dec': d['coin_dec'], 'BTC_Price': d['price']}
 st.session_state.history = pd.concat([st.session_state.history, pd.DataFrame([new_row])], ignore_index=True)
 if len(st.session_state.history) > 60: st.session_state.history = st.session_state.history.iloc[1:]
 
-if st.session_state.start_oi == 0: st.session_state.start_oi = d['total_oi']
-oi_change = d['total_oi'] - st.session_state.start_oi
-
-# METRICS
+# Top Metrics
 m1, m2 = st.columns(2)
-with m1: st.metric("BTC PRICE", f"${d['price']:,.0f}", delta=f"{oi_change:,.0f} OI")
-with m2: st.metric("MAX PAIN", f"${d['max_pain']:,.0f}", delta="Magnet")
+with m1: st.metric("BTC PRICE", f"${d['price']:,.0f}", delta=d['source'])
+with m2: st.metric("FUNDING", f"{d['funding']:.4f}%", delta="Normal" if d['funding'] < 0.01 else "High")
 
 m3, m4 = st.columns(2)
-with m3: 
-    gex_txt = "VOLATILE" if d['gex'] < 0 else "STABLE"
-    st.metric("NET GEX", f"${d['gex']/1_000_000:.1f}M", delta=gex_txt, delta_color="normal" if d['gex']>0 else "inverse")
-with m4: st.metric("NSE BREADTH", f"{d['nse_adv']} / {d['nse_dec']}", delta="Bullish" if d['nse_adv']>d['nse_dec'] else "Bearish")
+with m3: st.metric("RESISTANCE", f"${d['call_wall']:,.0f}" if d['call_wall'] > 0 else "---")
+with m4: st.metric("SUPPORT", f"${d['put_wall']:,.0f}" if d['put_wall'] > 0 else "---")
 
-# SIGNALS
+# Chart
 st.write("---")
-st.markdown("##### 🧱 WALLS & SIGNALS")
-c1, c2 = st.columns(2)
-with c1:
-    st.error(f"RESISTANCE: ${d['call_wall']:,.0f}")
-    st.success(f"SUPPORT: ${d['put_wall']:,.0f}")
-with c2:
-    sig_text, sig_color = "WAITING", "gray"
-    if d['price'] < d['max_pain'] and d.get('ls_ratio', 1.0) < 0.9: sig_text, sig_color = "BUY", "green"
-    elif d['price'] > d['max_pain'] and d['funding'] > 0.02: sig_text, sig_color = "SELL", "red"
-    st.markdown(f"### :{sig_color}[{sig_text}]")
-
-# CHARTS
-st.write("---")
-st.plotly_chart(create_tv_chart(st.session_state.history, 'Coin_Adv', 'Coin_Dec', "Crypto Market Breadth", '#2962FF', '#FF9800'), use_container_width=True)
+if not st.session_state.history.empty:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=st.session_state.history['Time'], y=st.session_state.history['Coin_Adv'], name='Advancing', line=dict(color='#00E396')))
+    fig.add_trace(go.Scatter(x=st.session_state.history['Time'], y=st.session_state.history['Coin_Dec'], name='Declining', line=dict(color='#FF4560')))
+    fig.update_layout(title="Market Breath", paper_bgcolor='#1e222d', plot_bgcolor='#131722', font=dict(color='#d1d4dc'))
+    st.plotly_chart(fig, use_container_width=True)
 
 time.sleep(10)
 st.rerun()
